@@ -22,6 +22,7 @@ use theme_settings::ThemeSettings;
 use util::maybe;
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::mem;
 use std::ops::Range;
@@ -380,6 +381,12 @@ impl MarkdownStyle {
 
 pub struct Markdown {
     source: SharedString,
+    /// Accumulates streamed appends without rebuilding the full `SharedString`
+    /// for every chunk. It is promoted when the next parse starts.
+    source_buf: Option<String>,
+    /// Preserves the `source() -> &SharedString` contract when callers inspect
+    /// content while a parse is already pending.
+    source_snapshot: OnceCell<SharedString>,
     selection: Selection,
     pressed_link: Option<RenderedLink>,
     pressed_footnote_ref: Option<RenderedFootnoteRef>,
@@ -573,6 +580,8 @@ impl Markdown {
         };
         let mut this = Self {
             source,
+            source_buf: None,
+            source_snapshot: OnceCell::new(),
             selection: Selection::default(),
             pressed_link: None,
             pressed_footnote_ref: None,
@@ -705,7 +714,12 @@ impl Markdown {
     }
 
     pub fn source(&self) -> &SharedString {
-        &self.source
+        if let Some(source_buf) = self.source_buf.as_ref() {
+            self.source_snapshot
+                .get_or_init(|| SharedString::from(source_buf.clone()))
+        } else {
+            &self.source
+        }
     }
 
     pub fn first_code_block_language(&self) -> Option<Arc<Language>> {
@@ -731,11 +745,17 @@ impl Markdown {
     }
 
     pub fn append(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.source = SharedString::new(self.source.to_string() + text);
+        self.source_snapshot = OnceCell::new();
+        let source_buf = self
+            .source_buf
+            .get_or_insert_with(|| self.source.to_string());
+        source_buf.push_str(text);
         self.parse(cx);
     }
 
     pub fn replace(&mut self, source: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.source_buf = None;
+        self.source_snapshot = OnceCell::new();
         self.source = source.into();
         self.parse(cx);
     }
@@ -775,6 +795,8 @@ impl Markdown {
         if &source == self.source() {
             return;
         }
+        self.source_buf = None;
+        self.source_snapshot = OnceCell::new();
         self.source = source;
         self.selection = Selection::default();
         self.autoscroll_request = None;
@@ -925,8 +947,28 @@ impl Markdown {
         self.context_menu_selected_markdown.as_ref()
     }
 
+    fn source_for_parse(&mut self) -> SharedString {
+        if let Some(snapshot) = self.source_snapshot.take() {
+            self.source = snapshot;
+            self.source_buf = None;
+        } else if let Some(source_buf) = self.source_buf.take() {
+            self.source = SharedString::from(source_buf);
+        }
+        self.source.clone()
+    }
+
     fn parse(&mut self, cx: &mut Context<Self>) {
-        if self.source.is_empty() {
+        let is_empty = self
+            .source_buf
+            .as_ref()
+            .map_or_else(|| self.source.is_empty(), String::is_empty);
+
+        if is_empty {
+            self.source_buf = None;
+            self.source_snapshot = OnceCell::new();
+            if !self.source.is_empty() {
+                self.source = SharedString::default();
+            }
             self.should_reparse = false;
             self.pending_parse.take();
             self.parsed_markdown = ParsedMarkdown {
@@ -946,11 +988,11 @@ impl Markdown {
             return;
         }
         self.should_reparse = false;
-        self.pending_parse = Some(self.start_background_parse(cx));
+        let source = self.source_for_parse();
+        self.pending_parse = Some(self.start_background_parse(source, cx));
     }
 
-    fn start_background_parse(&self, cx: &Context<Self>) -> Task<()> {
-        let source = self.source.clone();
+    fn start_background_parse(&self, source: SharedString, cx: &Context<Self>) -> Task<()> {
         let should_parse_links_only = self.options.parse_links_only;
         let should_parse_html = self.options.parse_html;
         let should_render_mermaid_diagrams = self.options.render_mermaid_diagrams;
@@ -5621,6 +5663,86 @@ mod tests {
                 ThemeSettings::get_global(cx).markdown_preview_font_size(cx),
                 px(24.0)
             );
+        });
+    }
+
+    #[gpui::test]
+    fn append_buffered_accumulates_correctly(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown = cx.new(|cx| Markdown::new("prefix".into(), None, None, cx));
+        cx.run_until_parked();
+
+        markdown.update(cx, |markdown, cx| {
+            for _ in 0..1000 {
+                markdown.append("x", cx);
+            }
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let expected = format!("prefix{}", "x".repeat(1000));
+            assert_eq!(markdown.read(cx).source(), expected.as_str());
+        });
+    }
+
+    #[gpui::test]
+    fn source_getter_reflects_and_invalidates_pending_snapshots(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown = cx.new(|cx| Markdown::new("hello".into(), None, None, cx));
+        cx.run_until_parked();
+
+        markdown.update(cx, |markdown, cx| {
+            markdown.append(" world", cx);
+            markdown.append("!", cx);
+            assert!(markdown.source_buf.is_some());
+            assert_eq!(markdown.source(), "hello world!");
+
+            markdown.append("?", cx);
+            assert_eq!(markdown.source(), "hello world!?");
+        });
+    }
+
+    #[gpui::test]
+    fn replace_clears_pending_buffer_and_snapshot(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown = cx.new(|cx| Markdown::new("".into(), None, None, cx));
+        cx.run_until_parked();
+
+        markdown.update(cx, |markdown, cx| {
+            markdown.append("a", cx);
+            markdown.append("a", cx);
+            assert!(markdown.source_buf.is_some());
+            assert_eq!(markdown.source(), "aa");
+            assert!(markdown.source_snapshot.get().is_some());
+
+            markdown.replace(SharedString::new_static("b"), cx);
+            assert!(markdown.source_buf.is_none());
+            assert!(markdown.source_snapshot.get().is_none());
+            assert_eq!(markdown.source(), "b");
         });
     }
 }
